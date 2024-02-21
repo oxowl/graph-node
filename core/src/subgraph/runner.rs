@@ -60,13 +60,14 @@ where
         logger: Logger,
         metrics: RunnerMetrics,
         env_vars: Arc<EnvVars>,
+        synced: bool,
     ) -> Self {
         Self {
             inputs: Arc::new(inputs),
             ctx,
             state: IndexingState {
                 should_try_unfail_non_deterministic: true,
-                synced: false,
+                synced,
                 skip_ptr_updates_timer: Instant::now(),
                 backoff: ExponentialBackoff::with_jitter(
                     (MINUTE * 2).min(env_vars.subgraph_error_retry_ceil),
@@ -597,7 +598,7 @@ where
 
         // To prevent a buggy pending version from replacing a current version, if errors are
         // present the subgraph will be unassigned.
-        if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced().await? {
+        if has_errors && !ENV_VARS.disable_fail_fast && !self.state.synced {
             store
                 .unassign_subgraph()
                 .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
@@ -755,11 +756,22 @@ where
 
         match action {
             Ok(action) => {
+                // Ensure that `state.cached_head_ptr` has a value since it could be `None` on the
+                // first iteration of loop.
+                // If the deployment head has caught up to the `cached_head_ptr`, update it so that
+                // we are up to date when checking if synced.
+                let cached_head_ptr = self.state.cached_head_ptr.cheap_clone();
+                if cached_head_ptr.is_none() || close_to_chain_head(&block_ptr, cached_head_ptr, 1)
+                {
+                    self.state.cached_head_ptr =
+                        self.inputs.chain.chain_store().chain_head_ptr().await?;
+                }
+
                 // Once synced, no need to try to update the status again.
                 if !self.state.synced
                     && close_to_chain_head(
                         &block_ptr,
-                        self.inputs.chain.chain_store().chain_head_ptr().await?,
+                        self.state.cached_head_ptr.cheap_clone(),
                         // We consider a subgraph synced when it's at most 1 block behind the
                         // chain head.
                         1,
@@ -1300,7 +1312,7 @@ where
 
         // To prevent a buggy pending version from replacing a current version, if errors are
         // present the subgraph will be unassigned.
-        if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced().await? {
+        if has_errors && !ENV_VARS.disable_fail_fast && !self.state.synced {
             store
                 .unassign_subgraph()
                 .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
